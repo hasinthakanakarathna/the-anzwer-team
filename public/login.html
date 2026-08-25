@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Sign in | ANZWER Operations</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="auth-body">
+    <main class="auth-layout"><section class="auth-intro"><span class="brand-mark">A</span><p class="eyebrow">ANZWER / OPERATIONS</p><h1>Make work<br /><em>visible.</em></h1><p>One calm place for service work, daily activity, and the people behind it.</p></section><section class="auth-panel"><p class="eyebrow">Secure workspace</p><h2>Sign in</h2>
+
+      <div class="auth-field"><label>Username</label><input id="username" autocomplete="username" /></div>
+      <div class="auth-field"><label>Password</label><input id="password" type="password" autocomplete="current-password" /></div>
+
+      <div class="auth-actions"><button id="loginBtn" class="button-primary">Enter workspace <span>→</span></button><a href="register.html" class="button-secondary">Create account</a></div>
+
+      <div id="loginError" class="form-message error hidden">Login failed</div><p class="auth-foot">Protected by session-based access controls.</p></section></main>
+
+    <script src="csrf.js"></script>
+    <script src="login-page.js"></script>
+  </body>
+</html>

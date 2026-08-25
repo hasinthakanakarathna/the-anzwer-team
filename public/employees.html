@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Team & Access | ANZWER Operations</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="app-body">
+    <div class="app-layout">
+      <aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">A</span><span><strong>ANZWER</strong><small>Operations</small></span></a><nav class="main-nav"><a href="index.html">Overview</a><a href="tickets.html">Ticket desk</a><a href="reports.html">Daily reports</a><a class="active" href="employees.html">Team & access</a></nav><div class="sidebar-foot">ADMINISTRATION<br /><span>TEAM / ACCESS</span></div></aside>
+      <main class="page-content"><header class="page-header"><div><p class="eyebrow">Administration / directory</p><h1>Team & access</h1><p class="lede">Invite teammates and decide who can manage the service desk.</p></div><div><a href="index.html" class="button-secondary">Back to overview</a></div></header>
+        <section class="panel people-panel"><div class="toolbar"><div><p class="eyebrow">New teammate</p><h2>Generate an invitation</h2></div><form id="addForm" class="toolbar-actions"><input id="employeeNameInput" placeholder="Name (optional)" class="field compact" /><input id="employeeEmailInput" type="email" placeholder="Email (optional)" class="field compact" /><label class="access-check"><input id="adminAccessInput" type="checkbox" /> Admin access</label><button type="submit" class="button-primary">Generate code <span>+</span></button></form></div><p id="addError" class="form-message hidden"></p><p id="inviteResult" class="invite-result hidden"></p><ul id="employeeList" class="people-list"></ul></section>
+      </main>
+    </div>
+
+    <script src="csrf.js"></script>
+    <script src="index-page.js"></script>
+    <script src="employees-page.js"></script>
+  </body>
+</html>

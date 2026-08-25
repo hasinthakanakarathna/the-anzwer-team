@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Daily Reports | ANZWER Operations</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="app-body">
+    <div class="app-layout">
+      <aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">A</span><span><strong>ANZWER</strong><small>Operations</small></span></a><nav class="main-nav"><a href="index.html">Overview</a><a href="tickets.html">Ticket desk</a><a class="active" href="reports.html">Daily reports</a><a href="employees.html">People & access</a></nav><div class="sidebar-foot">REPORTING<br /><span>ACTIVITY / SHIFT SUMMARY</span></div></aside>
+      <main class="page-content"><header class="page-header"><div><p class="eyebrow">Work management / shift close</p><h1>Daily reports</h1><p class="lede">A clean record of the work behind the queue.</p></div><div class="user-area"><span id="employeeDisplay">Loading session...</span><button id="logoutButton" class="button-secondary">Log out</button></div></header>
+        <div class="report-layout"><section class="panel report-form-panel"><div class="section-heading"><div><p class="eyebrow">Report builder</p><h2>Shift summary</h2></div><span class="stamp">LIVE</span></div><p id="activityStatus" class="form-note">Loading today’s captured activity...</p><form id="reportForm" class="stack-form"><label>Department<input id="titleInput" value="THE ANZWER IT SUPPORT" readonly class="field" /></label><label>Shift start<input id="shiftStartInput" value="9 A.M" readonly class="field" /></label><label>Presence<select id="statusSelect" class="field"><option>RUNNING</option><option>RESTING</option></select></label><label>Activity level<select id="modeSelect" class="field"><option>WORKING DAY - LOW ACTIVITY</option><option>WORKING DAY - ACTIVE</option></select></label><div id="activeTaskWrap"><label>Additional activity<textarea id="taskText" rows="9" class="field" placeholder="Automatic ticket activity will appear here. Add anything the system missed."></textarea></label></div><div class="button-row"><button id="resetButton" type="button" class="button-secondary">Reset</button><button id="copyButton" type="button" class="button-primary">Copy report</button><button id="downloadPdf" type="button" class="button-secondary">Export PDF</button><button id="submitReport" type="button" class="button-primary">Submit to management <span>→</span></button></div><p id="submitMessage" class="form-message hidden"></p></form></section><section class="report-preview"><div class="section-heading"><div><p class="eyebrow">Presentation mode</p><h2>Live report preview</h2></div><span class="terminal-label">AUTO + EDIT</span></div><div id="terminalPreview" class="terminal-window"><pre id="previewText"></pre></div><p class="preview-note">Captured ticket activity is editable here before submission. Changes are stored with your report.</p></section></div>
+      </main>
+    </div>
+    <div id="toast" class="toast pointer-events-none fixed right-5 top-5 hidden">Copied to clipboard</div>
+    <script src="csrf.js"></script><script src="app.js"></script><script src="index-page.js"></script><script src="reports-page.js"></script>
+  </body>
+</html>

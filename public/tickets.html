@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ticket Desk | ANZWER Operations</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="app-body">
+    <div class="app-layout">
+      <aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">A</span><span><strong>ANZWER</strong><small>Operations</small></span></a><nav class="main-nav"><a href="index.html">Overview</a><a class="active" href="tickets.html">Ticket desk</a><a href="reports.html">Daily reports</a><a href="employees.html">People & access</a></nav><div class="sidebar-foot">SERVICE DESK<br /><span>LOCAL / AUDIT READY</span></div></aside>
+      <main class="page-content"><header class="page-header"><div><p class="eyebrow">ITSM / queue management</p><h1>Ticket desk</h1><p class="lede">Triage, track, and move service work forward.</p></div><div class="user-area"><span id="employeeDisplay">Loading session...</span><button id="logoutButton" class="button-secondary">Log out</button></div></header>
+        <section class="desk-layout"><div class="panel overflow-hidden"><div class="toolbar"><div><p class="eyebrow">All work</p><h2>Tickets</h2></div><div class="toolbar-actions"><select id="statusFilter" class="field compact"><option value="">Every status</option><option>NEW</option><option>ASSIGNED</option><option>IN_PROGRESS</option><option>PENDING</option><option>RESOLVED</option></select><select id="priorityFilter" class="field compact"><option value="">Every priority</option><option>P1</option><option>P2</option><option>P3</option><option>P4</option></select></div></div><div class="overflow-x-auto"><table class="ticket-table"><thead><tr><th>Reference</th><th>Request</th><th>State</th><th>Priority</th><th>Requester</th><th>Assignee</th></tr></thead><tbody id="ticketRows"></tbody></table></div></div><aside class="panel create-panel"><p class="eyebrow">New work</p><h2>Log a ticket</h2><p class="form-note">Priority is calculated from impact and urgency.</p><form id="ticketForm" class="stack-form"><select id="ticketType" class="field"><option value="INCIDENT">Incident</option><option value="REQUEST">Service request</option><option value="PROBLEM">Problem</option><option value="CHANGE">Change</option><option value="TASK">Task</option></select><input id="ticketTitle" class="field" maxlength="160" placeholder="Short description" required /><textarea id="ticketDescription" class="field large-field" maxlength="20000" placeholder="Describe the request or impact"></textarea><div class="split-fields"><select id="ticketImpact" class="field"><option value="1">Low impact</option><option value="2" selected>Medium impact</option><option value="3">High impact</option></select><select id="ticketUrgency" class="field"><option value="1">Low urgency</option><option value="2" selected>Medium urgency</option><option value="3">High urgency</option></select></div><button class="button-primary" type="submit">Create ticket <span>→</span></button><p id="ticketMessage" class="hidden form-message"></p></form></aside></section>
+      </main>
+    </div>
+    <script src="csrf.js"></script><script src="index-page.js"></script><script src="tickets-page.js"></script>
+  </body>
+</html>
