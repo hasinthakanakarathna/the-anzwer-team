@@ -34,7 +34,23 @@ async function loadTickets() {
   const data = await response.json();
   const rows = document.getElementById('ticketRows');
   rows.innerHTML = data.tickets.length ? data.tickets.map((ticket) => `
-    <tr class="table-row"><td class="font-mono text-xs text-emerald-400">${escapeText(ticket.ticket_number)}</td><td><div class="font-medium">${escapeText(ticket.title)}</div><div class="mt-1 text-xs text-slate-500">${escapeText(ticket.type)} · ${escapeText(ticket.requester)}</div></td><td><span class="badge">${escapeText(ticket.status.replace('_', ' '))}</span></td><td><span class="priority ${escapeText(ticket.priority.toLowerCase())}">${escapeText(ticket.priority)}</span></td><td class="text-slate-400">${escapeText(ticket.assignee || 'Unassigned')}</td></tr>`).join('') : '<tr><td colspan="5" class="empty-state">No tickets match this queue.</td></tr>';
+    <tr class="table-row ticket-link" data-id="${escapeText(ticket.id)}" tabindex="0" role="link">
+      <td class="font-mono text-xs text-emerald-400">${escapeText(ticket.ticket_number)}</td>
+      <td><div class="font-medium">${escapeText(ticket.title)}</div><div class="mt-1 text-xs text-slate-500">${escapeText(ticket.type)} · ${escapeText(ticket.requester)}</div></td>
+      <td><span class="badge">${escapeText(ticket.status.replace('_', ' '))}</span></td>
+      <td><span class="priority ${escapeText(ticket.priority.toLowerCase())}">${escapeText(ticket.priority)}</span></td>
+      <td class="text-slate-400">${escapeText(ticket.assignee || 'Unassigned')}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty-state">No tickets match this queue.</td></tr>';
+  rows.querySelectorAll('tr[data-id]').forEach((row) => {
+    row.addEventListener('click', () => {
+      window.location.href = `ticket.html?id=${encodeURIComponent(row.dataset.id)}`;
+    });
+    row.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      window.location.href = `ticket.html?id=${encodeURIComponent(row.dataset.id)}`;
+    });
+  });
 }
 
 document.getElementById('ticketForm').addEventListener('submit', async (event) => {

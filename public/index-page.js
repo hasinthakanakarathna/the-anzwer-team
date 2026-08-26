@@ -12,7 +12,7 @@ async function whoami() {
     return;
   }
   const page = window.location.pathname.split('/').pop();
-  if (user.accountType === 'CLIENT' && !['client.html', 'profile.html'].includes(page)) {
+  if (user.accountType === 'CLIENT' && !['client.html', 'profile.html', 'ticket.html'].includes(page)) {
     window.location.href = '/client.html';
     return;
   }

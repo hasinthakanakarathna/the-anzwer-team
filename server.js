@@ -1,21 +1,22 @@
+require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const helmet = require('helmet');
 const bcrypt = require('bcrypt');
 const cookieParser = require('cookie-parser');
 const csurf = require('csurf');
 const rateLimit = require('express-rate-limit');
 const session = require('express-session');
-const FileStore = require('session-file-store')(session);
-const Database = require('better-sqlite3');
 const crypto = require('crypto');
+const { firestore, nextCounter, getDoc, queryOne } = require('./firestore');
+const FirestoreSessionStore = require('./firestore-session-store');
+const { analyzeWorkInterval } = require('./shifts');
+const { registerOperations, startChatRetentionScheduler } = require('./operations');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-// Every request gets a traceable identifier for logs, errors, and audit events.
 app.use((req, res, next) => {
   const supplied = req.get('X-Request-ID');
   req.requestId = supplied && /^[A-Za-z0-9_.-]{1,80}$/.test(supplied) ? supplied : `req_${crypto.randomUUID()}`;
@@ -23,35 +24,21 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------------------------------------------------------------------------
-// Hard fail if a real secret hasn't been provided in production. Never ship
-// with the fallback dev secret.
-// ---------------------------------------------------------------------------
 if (IS_PROD && !process.env.SESSION_SECRET) {
   console.error('FATAL: SESSION_SECRET environment variable must be set in production.');
   process.exit(1);
 }
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
 
-// Keep all persistent data (db + sessions) outside of anything web-servable.
-// On Fly.io this points at the mounted volume; locally it defaults to ./data.
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-// If behind a reverse proxy (nginx, Heroku, etc.) so secure cookies work.
 if (IS_PROD) app.set('trust proxy', 1);
 
-// ---------------------------------------------------------------------------
-// Security headers. Tailwind's CDN build and html2pdf.js both need to be
-// explicitly allow-listed; everything else defaults to 'self'.
-// ---------------------------------------------------------------------------
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", 'https://cdn.tailwindcss.com', 'https://cdnjs.cloudflare.com'],
-        styleSrc: ["'self'", "'unsafe-inline'"], // Tailwind's CDN build injects inline <style>
+        styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", 'data:'],
         connectSrc: ["'self'"],
         objectSrc: ["'none'"],
@@ -69,34 +56,27 @@ app.use(cookieParser());
 
 app.use(
   session({
-    store: new FileStore({ path: path.join(DATA_DIR, 'sessions'), secret: SESSION_SECRET, logFn: () => {} }),
+    store: new FirestoreSessionStore(session, { firestore, collection: 'sessions' }),
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    name: 'sid', // don't advertise "connect.sid" / express defaults
+    name: 'sid',
     cookie: {
       httpOnly: true,
       sameSite: 'lax',
-      secure: IS_PROD, // requires HTTPS in production
-      maxAge: 8 * 60 * 60 * 1000, // 8 hour session
+      secure: IS_PROD,
+      maxAge: 8 * 60 * 60 * 1000,
     },
   })
 );
 
-// CSRF protection, keyed off the session (no extra cookie needed).
-// Safe methods (GET/HEAD/OPTIONS) are exempt automatically.
 const csrfProtection = csurf({ cookie: false });
 app.use(csrfProtection);
 
-// Let the front-end fetch a token before making a state-changing request.
 app.get('/api/csrf-token', (req, res) => {
   res.json({ csrfToken: req.csrfToken() });
 });
 
-// ---------------------------------------------------------------------------
-// Rate limiting on the auth endpoints most attractive to brute-force/credential
-// stuffing. Keyed by IP; tune windowMs/max to your traffic.
-// ---------------------------------------------------------------------------
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -113,180 +93,19 @@ const identityPreviewLimiter = rateLimit({
   message: { error: 'Too many identity previews. Please wait and try again.' },
 });
 
-// DB
-const db = new Database(path.join(DATA_DIR, 'data.sqlite'));
-db.pragma('journal_mode = WAL');
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'employee'
-);
-
-CREATE TABLE IF NOT EXISTS reports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  version INTEGER PRIMARY KEY,
-  applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS tickets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ticket_number TEXT UNIQUE NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('INCIDENT', 'REQUEST', 'PROBLEM', 'CHANGE', 'TASK')),
-  title TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'NEW',
-  priority TEXT NOT NULL DEFAULT 'P3',
-  impact INTEGER NOT NULL DEFAULT 2 CHECK (impact BETWEEN 1 AND 3),
-  urgency INTEGER NOT NULL DEFAULT 2 CHECK (urgency BETWEEN 1 AND 3),
-  requester_id INTEGER NOT NULL,
-  assignee_id INTEGER,
-  assigned_team TEXT,
-  category TEXT,
-  due_at DATETIME,
-  resolution TEXT,
-  created_by INTEGER NOT NULL,
-  updated_by INTEGER NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  resolved_at DATETIME,
-  closed_at DATETIME,
-  FOREIGN KEY (requester_id) REFERENCES users(id),
-  FOREIGN KEY (assignee_id) REFERENCES users(id),
-  FOREIGN KEY (created_by) REFERENCES users(id),
-  FOREIGN KEY (updated_by) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_status_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ticket_id INTEGER NOT NULL,
-  from_status TEXT,
-  to_status TEXT NOT NULL,
-  actor_id INTEGER NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (ticket_id) REFERENCES tickets(id),
-  FOREIGN KEY (actor_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_comments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ticket_id INTEGER NOT NULL,
-  author_id INTEGER NOT NULL,
-  body TEXT NOT NULL,
-  visibility TEXT NOT NULL DEFAULT 'PUBLIC' CHECK (visibility IN ('PUBLIC', 'INTERNAL')),
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (ticket_id) REFERENCES tickets(id),
-  FOREIGN KEY (author_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_work_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ticket_id INTEGER NOT NULL,
-  author_id INTEGER NOT NULL,
-  started_at DATETIME NOT NULL,
-  ended_at DATETIME NOT NULL,
-  activity TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (ticket_id) REFERENCES tickets(id),
-  FOREIGN KEY (author_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  actor_id INTEGER,
-  action TEXT NOT NULL,
-  resource TEXT NOT NULL,
-  resource_id TEXT,
-  ip_address TEXT,
-  user_agent TEXT,
-  result TEXT NOT NULL,
-  old_value TEXT,
-  new_value TEXT,
-  request_id TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (actor_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_sequences (
-  year INTEGER NOT NULL,
-  type TEXT NOT NULL,
-  next_value INTEGER NOT NULL DEFAULT 1,
-  PRIMARY KEY (year, type)
-);
-
-CREATE TABLE IF NOT EXISTS identity_sequences (
-  birth_year INTEGER NOT NULL,
-  account_type TEXT NOT NULL,
-  next_value INTEGER NOT NULL DEFAULT 1,
-  PRIMARY KEY (birth_year, account_type)
-);
-
-CREATE TABLE IF NOT EXISTS team_invitations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  reference_code TEXT UNIQUE NOT NULL,
-  invited_name TEXT,
-  invited_email TEXT,
-  admin_access INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'USED', 'REVOKED')),
-  created_by INTEGER NOT NULL,
-  used_by INTEGER,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  used_at DATETIME,
-  FOREIGN KEY (created_by) REFERENCES users(id),
-  FOREIGN KEY (used_by) REFERENCES users(id)
-);
-`);
-
-const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
-const addUserColumn = (definition, name) => {
-  if (!userColumns.includes(name)) db.exec(`ALTER TABLE users ADD COLUMN ${definition}`);
-};
-addUserColumn("account_type TEXT NOT NULL DEFAULT 'EMPLOYEE'", 'account_type');
-addUserColumn("account_status TEXT NOT NULL DEFAULT 'ACTIVE'", 'account_status');
-addUserColumn('employee_id TEXT', 'employee_id');
-addUserColumn('customer_id TEXT', 'customer_id');
-addUserColumn('full_name TEXT', 'full_name');
-addUserColumn('email TEXT', 'email');
-addUserColumn('phone TEXT', 'phone');
-addUserColumn('department TEXT', 'department');
-addUserColumn('job_title TEXT', 'job_title');
-addUserColumn('location TEXT', 'location');
-addUserColumn('shop_name TEXT', 'shop_name');
-addUserColumn('linkedin_url TEXT', 'linkedin_url');
-addUserColumn('instagram_url TEXT', 'instagram_url');
-addUserColumn('whatsapp_url TEXT', 'whatsapp_url');
-addUserColumn('github_url TEXT', 'github_url');
-addUserColumn('verified_at DATETIME', 'verified_at');
-addUserColumn('approved_by INTEGER', 'approved_by');
-addUserColumn('force_password_reset INTEGER NOT NULL DEFAULT 0', 'force_password_reset');
-db.exec("UPDATE users SET account_type = CASE WHEN role = 'admin' THEN 'ADMIN' ELSE 'EMPLOYEE' END WHERE account_type IS NULL OR account_type = ''");
-db.exec("UPDATE users SET account_type = 'ADMIN' WHERE role = 'admin'");
-db.exec("UPDATE users SET account_status = 'ACTIVE' WHERE account_status IS NULL OR account_status = ''");
-db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)').run();
-db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)').run();
-
-const getUserByUsername = db.prepare(`SELECT id, username, password_hash, role, account_type, account_status,
-  employee_id, customer_id, full_name, email, phone, department, job_title, force_password_reset
-  FROM users WHERE username = ?`);
-const createUser = db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)');
+function nowIso() {
+  return new Date().toISOString();
+}
 
 function identityId(prefix) {
   return `${prefix}-${new Date().getUTCFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
-function createTeamReference() {
+async function createTeamReference() {
   let code;
   do {
     code = `ANZ-TEAM-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
-  } while (db.prepare('SELECT 1 FROM team_invitations WHERE reference_code = ?').get(code));
+  } while (await queryOne('team_invitations', 'reference_code', code));
   return code;
 }
 
@@ -297,19 +116,15 @@ function extractBirthYear(nic) {
   return /^\d{4}[A-Za-z0-9]{4,}$/.test(normalized) && year >= 1900 && year <= new Date().getUTCFullYear() ? year : null;
 }
 
-function createRecognizedIdentity(accountType, birthYear) {
+async function createRecognizedIdentity(accountType, birthYear) {
   const prefix = accountType === 'EMPLOYEE' ? 'EMP' : 'CLI';
-  const create = db.transaction(() => {
-    db.prepare('INSERT OR IGNORE INTO identity_sequences (birth_year, account_type) VALUES (?, ?)').run(birthYear, accountType);
-    const current = db.prepare('SELECT next_value FROM identity_sequences WHERE birth_year = ? AND account_type = ?').get(birthYear, accountType).next_value;
-    const existingIds = db.prepare(`SELECT employee_id AS identity FROM users WHERE account_type = 'EMPLOYEE' AND employee_id LIKE ?
-      UNION ALL SELECT customer_id AS identity FROM users WHERE account_type = 'CLIENT' AND customer_id LIKE ?`).all(`${prefix}${birthYear}%`, `${prefix}${birthYear}%`);
-    const highestExisting = existingIds.reduce((highest, row) => Math.max(highest, Number(String(row.identity || '').slice(7)) || 0), 0);
-    const sequence = Math.max(current, highestExisting + 1);
-    db.prepare('UPDATE identity_sequences SET next_value = ? WHERE birth_year = ? AND account_type = ?').run(sequence + 1, birthYear, accountType);
+  const seqRef = firestore.collection('identity_sequences').doc(`${birthYear}_${accountType}`);
+  return firestore.runTransaction(async (tx) => {
+    const seqSnap = await tx.get(seqRef);
+    const sequence = seqSnap.exists ? Number(seqSnap.data().next_value || 1) : 1;
+    tx.set(seqRef, { birth_year: birthYear, account_type: accountType, next_value: sequence + 1 }, { merge: true });
     return `${prefix}${birthYear}${String(sequence).padStart(4, '0')}`;
   });
-  return create();
 }
 
 function publicUser(user) {
@@ -336,22 +151,40 @@ function publicUser(user) {
   };
 }
 
-// Seed an admin if none exists
-const adminExists = db.prepare("SELECT COUNT(*) as c FROM users WHERE role = 'admin'").get().c;
-(async () => {
-  if (!adminExists) {
-    const pw = require('crypto').randomBytes(9).toString('base64url');
-    const hash = await bcrypt.hash(pw, 12);
-    createUser.run('admin', hash, 'admin');
-    db.prepare("UPDATE users SET account_type = 'ADMIN', account_status = 'ACTIVE', full_name = 'System Administrator' WHERE username = 'admin'").run();
-    console.log('Seeded admin user -> username: admin password:', pw);
-    console.log('Please log in and change this password immediately.');
-  }
-})();
+async function seedAdminIfNeeded() {
+  const admins = await firestore.collection('users').where('role', '==', 'admin').limit(1).get();
+  if (!admins.empty) return;
+  const pw = crypto.randomBytes(9).toString('base64url');
+  const hash = await bcrypt.hash(pw, 12);
+  const id = await nextCounter('users');
+  await firestore.collection('users').doc(id).set({
+    username: 'admin',
+    password_hash: hash,
+    role: 'admin',
+    account_type: 'ADMIN',
+    account_status: 'ACTIVE',
+    full_name: 'System Administrator',
+    employee_id: null,
+    customer_id: null,
+    email: null,
+    phone: null,
+    department: null,
+    job_title: null,
+    location: null,
+    shop_name: null,
+    linkedin_url: null,
+    instagram_url: null,
+    whatsapp_url: null,
+    github_url: null,
+    verified_at: nowIso(),
+    approved_by: null,
+    force_password_reset: 0,
+    created_at: nowIso(),
+  });
+  console.log('Seeded admin user -> username: admin password:', pw);
+  console.log('Please log in and change this password immediately.');
+}
 
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
 const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,32}$/;
 
 function isValidUsername(username) {
@@ -359,7 +192,6 @@ function isValidUsername(username) {
 }
 
 function isValidPassword(password) {
-  // At least 8 chars, at least one letter and one number.
   return (
     typeof password === 'string' &&
     password.length >= 8 &&
@@ -369,21 +201,29 @@ function isValidPassword(password) {
   );
 }
 
-function requireAuth(req, res, next) {
-  if (req.session && req.session.userId) {
-    const user = db.prepare('SELECT account_status FROM users WHERE id = ?').get(req.session.userId);
-    if (user && user.account_status !== 'DISABLED') return next();
+async function requireAuth(req, res, next) {
+  try {
+    if (req.session?.userId) {
+      const user = await getDoc('users', req.session.userId);
+      if (user && user.account_status !== 'DISABLED') return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized' });
+  } catch (error) {
+    return next(error);
   }
-  return res.status(401).json({ error: 'Unauthorized' });
 }
 
 function requireRole(role) {
-  return function (req, res, next) {
-    if (!req.session || !req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
-    const user = db.prepare('SELECT role, account_status FROM users WHERE id = ?').get(req.session.userId);
-    if (!user || user.account_status === 'DISABLED') return res.status(401).json({ error: 'Unauthorized' });
-    if (user.role !== role && user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-    next();
+  return async function (req, res, next) {
+    try {
+      if (!req.session?.userId) return res.status(401).json({ error: 'Unauthorized' });
+      const user = await getDoc('users', req.session.userId);
+      if (!user || user.account_status === 'DISABLED') return res.status(401).json({ error: 'Unauthorized' });
+      if (user.role !== role && user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+      return next();
+    } catch (error) {
+      return next(error);
+    }
   };
 }
 
@@ -404,10 +244,10 @@ function isStaff(req) {
   return STAFF_ROLES.has(req.session?.role);
 }
 
-function requireStaff(req, res, next) {
+async function requireStaff(req, res, next) {
   if (!req.session?.userId) return res.status(401).json({ error: 'Unauthorized', requestId: req.requestId });
   if (!isStaff(req)) return res.status(403).json({ error: 'Staff permission required', requestId: req.requestId });
-  next();
+  return next();
 }
 
 function priorityFor(impact, urgency) {
@@ -422,191 +262,402 @@ function ticketPrefix(type) {
   return { INCIDENT: 'INC', REQUEST: 'REQ', PROBLEM: 'PRB', CHANGE: 'CHG', TASK: 'TASK' }[type];
 }
 
-function audit(req, action, resource, resourceId, oldValue, newValue, result = 'SUCCESS') {
-  const actorExists = req.session?.userId && db.prepare('SELECT 1 FROM users WHERE id = ?').get(req.session.userId);
-  db.prepare(`INSERT INTO audit_logs
-    (actor_id, action, resource, resource_id, ip_address, user_agent, result, old_value, new_value, request_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    actorExists ? req.session.userId : null,
+async function audit(req, action, resource, resourceId, oldValue, newValue, result = 'SUCCESS') {
+  const actorId = req.session?.userId || null;
+  let actorExists = false;
+  if (actorId) {
+    const actor = await getDoc('users', actorId);
+    actorExists = Boolean(actor);
+  }
+  const id = await nextCounter('audit_logs');
+  await firestore.collection('audit_logs').doc(id).set({
+    actor_id: actorExists ? String(actorId) : null,
     action,
     resource,
-    resourceId ? String(resourceId) : null,
-    req.ip,
-    req.get('user-agent') || null,
+    resource_id: resourceId ? String(resourceId) : null,
+    ip_address: req.ip || null,
+    user_agent: req.get('user-agent') || null,
     result,
-    oldValue ? JSON.stringify(oldValue) : null,
-    newValue ? JSON.stringify(newValue) : null,
-    req.requestId
-  );
+    old_value: oldValue ? JSON.stringify(oldValue) : null,
+    new_value: newValue ? JSON.stringify(newValue) : null,
+    request_id: req.requestId,
+    created_at: nowIso(),
+  });
 }
 
-function ticketForUser(req, ticketId) {
-  const ticket = db.prepare(`SELECT t.*, requester.username AS requester, assignee.username AS assignee
-    FROM tickets t JOIN users requester ON requester.id = t.requester_id
-    LEFT JOIN users assignee ON assignee.id = t.assignee_id WHERE t.id = ?`).get(ticketId);
+async function usernameFor(userId) {
+  if (!userId) return null;
+  const user = await getDoc('users', userId);
+  return user?.username || null;
+}
+
+async function ticketForUser(req, ticketId) {
+  const ticket = await getDoc('tickets', ticketId);
   if (!ticket) return null;
-  if (!isStaff(req) && ticket.requester_id !== req.session.userId) return null;
-  return ticket;
+  if (!isStaff(req) && String(ticket.requester_id) !== String(req.session.userId)) return null;
+  return {
+    ...ticket,
+    requester: await usernameFor(ticket.requester_id),
+    assignee: await usernameFor(ticket.assignee_id),
+  };
 }
 
-// ITSM v1: additive API surface for the workbench.
-app.get('/api/v1/dashboard', requireAuth, (req, res) => {
-  const visibility = isStaff(req) ? '' : 'WHERE requester_id = @userId';
-  const params = isStaff(req) ? {} : { userId: req.session.userId };
-  const counts = db.prepare(`SELECT
-    COUNT(*) AS total,
-    SUM(status IN ('NEW', 'ASSIGNED', 'IN_PROGRESS', 'PENDING', 'REOPENED')) AS open,
-    SUM(status = 'IN_PROGRESS') AS in_progress,
-    SUM(status = 'PENDING') AS pending,
-    SUM(status = 'RESOLVED') AS resolved,
-    SUM(priority = 'P1' AND status NOT IN ('CLOSED', 'RESOLVED')) AS critical
-    FROM tickets ${visibility}`).get(params);
-  const recent = db.prepare(`SELECT ticket_number, type, title, status, priority, updated_at
-    FROM tickets ${visibility} ORDER BY updated_at DESC LIMIT 8`).all(params);
-  res.json({ counts, recent, role: req.session.role, requestId: req.requestId });
-});
+async function assertActiveStaff(userId) {
+  const user = await getDoc('users', userId);
+  if (!user || user.account_status !== 'ACTIVE') return null;
+  if (!['EMPLOYEE', 'ADMIN'].includes(user.account_type) && !['admin', 'employee'].includes(user.role)) return null;
+  return user;
+}
 
-app.get('/api/v1/tickets', requireAuth, (req, res) => {
-  const filters = [];
-  const params = {};
-  if (!isStaff(req)) {
-    filters.push('t.requester_id = @userId');
-    params.userId = req.session.userId;
-  }
-  if (typeof req.query.status === 'string' && TICKET_STATUSES.has(req.query.status)) {
-    filters.push('t.status = @status');
-    params.status = req.query.status;
-  }
-  if (typeof req.query.priority === 'string' && /^P[1-4]$/.test(req.query.priority)) {
-    filters.push('t.priority = @priority');
-    params.priority = req.query.priority;
-  }
-  const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-  const rows = db.prepare(`SELECT t.id, t.ticket_number, t.type, t.title, t.status, t.priority,
-    t.created_at, t.updated_at, requester.username AS requester, assignee.username AS assignee
-    FROM tickets t JOIN users requester ON requester.id = t.requester_id
-    LEFT JOIN users assignee ON assignee.id = t.assignee_id ${where} ORDER BY t.updated_at DESC LIMIT 100`).all(params);
-  res.json({ tickets: rows, requestId: req.requestId });
-});
-
-app.post('/api/v1/tickets', requireAuth, (req, res) => {
-  const { type, title, description = '', impact = 2, urgency = 2, category = null } = req.body || {};
-  const normalizedImpact = Number(impact);
-  const normalizedUrgency = Number(urgency);
-  if (!TICKET_TYPES.has(type) || typeof title !== 'string' || title.trim().length < 3 || title.length > 160) {
-    return res.status(400).json({ error: 'Type and title are required', requestId: req.requestId });
-  }
-  if (![1, 2, 3].includes(normalizedImpact) || ![1, 2, 3].includes(normalizedUrgency)) {
-    return res.status(400).json({ error: 'Impact and urgency must be between 1 and 3', requestId: req.requestId });
-  }
-  if (!isStaff(req) && !['INCIDENT', 'REQUEST'].includes(type)) {
-    return res.status(403).json({ error: 'Clients can only raise incidents or service requests', requestId: req.requestId });
-  }
-  const priority = priorityFor(normalizedImpact, normalizedUrgency);
+async function nextTicketNumber(type) {
   const year = new Date().getUTCFullYear();
-  const createTicket = db.transaction(() => {
-    db.prepare('INSERT OR IGNORE INTO ticket_sequences (year, type) VALUES (?, ?)').run(year, type);
-    const sequence = db.prepare('SELECT next_value FROM ticket_sequences WHERE year = ? AND type = ?').get(year, type).next_value;
-    db.prepare('UPDATE ticket_sequences SET next_value = next_value + 1 WHERE year = ? AND type = ?').run(year, type);
-    const ticketNumber = `${ticketPrefix(type)}-${year}-${String(sequence).padStart(6, '0')}`;
-    const result = db.prepare(`INSERT INTO tickets
-      (ticket_number, type, title, description, priority, impact, urgency, requester_id, created_by, updated_by, category)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(ticketNumber, type, title.trim(), String(description).slice(0, 20000), priority, normalizedImpact, normalizedUrgency, req.session.userId, req.session.userId, req.session.userId, category);
-    db.prepare('INSERT INTO ticket_status_history (ticket_id, to_status, actor_id) VALUES (?, ?, ?)').run(result.lastInsertRowid, 'NEW', req.session.userId);
-    return { id: result.lastInsertRowid, ticketNumber };
+  const seqRef = firestore.collection('ticket_sequences').doc(`${year}_${type}`);
+  return firestore.runTransaction(async (tx) => {
+    const snap = await tx.get(seqRef);
+    const sequence = snap.exists ? Number(snap.data().next_value || 1) : 1;
+    tx.set(seqRef, { year, type, next_value: sequence + 1 }, { merge: true });
+    return `${ticketPrefix(type)}-${year}-${String(sequence).padStart(6, '0')}`;
   });
-  const created = createTicket();
-  audit(req, 'TICKET_CREATED', 'ticket', created.id, null, { ticketNumber: created.ticketNumber, type, priority });
-  res.status(201).json({ ticket: ticketForUser(req, created.id), requestId: req.requestId });
-});
+}
 
-app.get('/api/v1/tickets/:id', requireAuth, (req, res) => {
-  const ticket = ticketForUser(req, Number(req.params.id));
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
-  const comments = db.prepare(`SELECT c.id, c.body, c.visibility, c.created_at, u.username AS author
-    FROM ticket_comments c JOIN users u ON u.id = c.author_id WHERE c.ticket_id = ? ${isStaff(req) ? '' : "AND c.visibility = 'PUBLIC'"} ORDER BY c.created_at`).all(ticket.id);
-  const history = db.prepare(`SELECT h.from_status, h.to_status, h.created_at, u.username AS actor
-    FROM ticket_status_history h JOIN users u ON u.id = h.actor_id WHERE h.ticket_id = ? ORDER BY h.created_at`).all(ticket.id);
-  const workLogs = db.prepare(`SELECT w.started_at, w.ended_at, w.activity, w.created_at, u.username AS author
-    FROM ticket_work_logs w JOIN users u ON u.id = w.author_id WHERE w.ticket_id = ? ORDER BY w.started_at`).all(ticket.id);
-  res.json({ ticket, comments, history, workLogs, requestId: req.requestId });
-});
-
-app.patch('/api/v1/tickets/:id', requireAuth, (req, res) => {
-  const ticket = ticketForUser(req, Number(req.params.id));
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
-  const nextStatus = req.body?.status;
-  if (!TICKET_STATUSES.has(nextStatus) || !STATUS_TRANSITIONS[ticket.status].includes(nextStatus)) {
-    return res.status(409).json({ error: `Invalid transition from ${ticket.status}`, requestId: req.requestId });
+app.get('/api/v1/dashboard', requireAuth, async (req, res, next) => {
+  try {
+    let ticketsSnap;
+    if (isStaff(req)) {
+      ticketsSnap = await firestore.collection('tickets').get();
+    } else {
+      ticketsSnap = await firestore.collection('tickets').where('requester_id', '==', String(req.session.userId)).get();
+    }
+    const tickets = ticketsSnap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const counts = {
+      total: tickets.length,
+      open: tickets.filter((t) => ['NEW', 'ASSIGNED', 'IN_PROGRESS', 'PENDING', 'REOPENED'].includes(t.status)).length,
+      in_progress: tickets.filter((t) => t.status === 'IN_PROGRESS').length,
+      pending: tickets.filter((t) => t.status === 'PENDING').length,
+      resolved: tickets.filter((t) => t.status === 'RESOLVED').length,
+      critical: tickets.filter((t) => t.priority === 'P1' && !['CLOSED', 'RESOLVED'].includes(t.status)).length,
+    };
+    const recent = tickets
+      .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+      .slice(0, 8)
+      .map(({ ticket_number, type, title, status, priority, updated_at }) => ({
+        ticket_number, type, title, status, priority, updated_at,
+      }));
+    res.json({ counts, recent, role: req.session.role, requestId: req.requestId });
+  } catch (error) {
+    next(error);
   }
-  if (!isStaff(req) && nextStatus !== 'CLOSED' && nextStatus !== 'PENDING') {
-    return res.status(403).json({ error: 'Staff permission required', requestId: req.requestId });
+});
+
+app.get('/api/v1/tickets', requireAuth, async (req, res, next) => {
+  try {
+    let query = firestore.collection('tickets');
+    if (!isStaff(req)) query = query.where('requester_id', '==', String(req.session.userId));
+    const snap = await query.get();
+    let rows = await Promise.all(snap.docs.map(async (doc) => {
+      const ticket = { id: doc.id, ...doc.data() };
+      return {
+        id: ticket.id,
+        ticket_number: ticket.ticket_number,
+        type: ticket.type,
+        title: ticket.title,
+        status: ticket.status,
+        priority: ticket.priority,
+        created_at: ticket.created_at,
+        updated_at: ticket.updated_at,
+        requester: await usernameFor(ticket.requester_id),
+        assignee: await usernameFor(ticket.assignee_id),
+      };
+    }));
+    if (typeof req.query.status === 'string' && TICKET_STATUSES.has(req.query.status)) {
+      rows = rows.filter((ticket) => ticket.status === req.query.status);
+    }
+    if (typeof req.query.priority === 'string' && /^P[1-4]$/.test(req.query.priority)) {
+      rows = rows.filter((ticket) => ticket.priority === req.query.priority);
+    }
+    rows = rows
+      .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+      .slice(0, 100);
+    res.json({ tickets: rows, requestId: req.requestId });
+  } catch (error) {
+    next(error);
   }
-  const now = new Date().toISOString();
-  db.transaction(() => {
-    db.prepare(`UPDATE tickets SET status = ?, updated_by = ?, updated_at = ?,
-      resolved_at = CASE WHEN ? = 'RESOLVED' THEN ? ELSE resolved_at END,
-      closed_at = CASE WHEN ? = 'CLOSED' THEN ? ELSE closed_at END WHERE id = ?`).run(nextStatus, req.session.userId, now, nextStatus, now, nextStatus, now, ticket.id);
-    db.prepare('INSERT INTO ticket_status_history (ticket_id, from_status, to_status, actor_id) VALUES (?, ?, ?, ?)').run(ticket.id, ticket.status, nextStatus, req.session.userId);
-  })();
-  audit(req, 'TICKET_STATUS_CHANGED', 'ticket', ticket.id, { status: ticket.status }, { status: nextStatus });
-  res.json({ ticket: ticketForUser(req, ticket.id), requestId: req.requestId });
 });
 
-app.post('/api/v1/tickets/:id/comments', requireAuth, (req, res) => {
-  const ticket = ticketForUser(req, Number(req.params.id));
-  const { body, visibility = 'PUBLIC' } = req.body || {};
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
-  if (typeof body !== 'string' || body.trim().length < 1 || body.length > 10000) return res.status(400).json({ error: 'Comment is required', requestId: req.requestId });
-  if (!['PUBLIC', 'INTERNAL'].includes(visibility) || (visibility === 'INTERNAL' && !isStaff(req))) return res.status(403).json({ error: 'Internal notes require staff access', requestId: req.requestId });
-  const result = db.prepare('INSERT INTO ticket_comments (ticket_id, author_id, body, visibility) VALUES (?, ?, ?, ?)').run(ticket.id, req.session.userId, body.trim(), visibility);
-  audit(req, visibility === 'INTERNAL' ? 'TICKET_INTERNAL_NOTE_ADDED' : 'TICKET_COMMENT_ADDED', 'ticket', ticket.id, null, { commentId: result.lastInsertRowid });
-  res.status(201).json({ id: result.lastInsertRowid, requestId: req.requestId });
+app.post('/api/v1/tickets', requireAuth, async (req, res, next) => {
+  try {
+    const { type, title, description = '', impact = 2, urgency = 2, category = null, assigneeId = null } = req.body || {};
+    const normalizedImpact = Number(impact);
+    const normalizedUrgency = Number(urgency);
+    if (!TICKET_TYPES.has(type) || typeof title !== 'string' || title.trim().length < 3 || title.length > 160) {
+      return res.status(400).json({ error: 'Type and title are required', requestId: req.requestId });
+    }
+    if (![1, 2, 3].includes(normalizedImpact) || ![1, 2, 3].includes(normalizedUrgency)) {
+      return res.status(400).json({ error: 'Impact and urgency must be between 1 and 3', requestId: req.requestId });
+    }
+    if (!isStaff(req) && !['INCIDENT', 'REQUEST'].includes(type)) {
+      return res.status(403).json({ error: 'Clients can only raise incidents or service requests', requestId: req.requestId });
+    }
+
+    let assignee = null;
+    let normalizedAssigneeId = null;
+    if (assigneeId != null && assigneeId !== '') {
+      assignee = await assertActiveStaff(String(assigneeId));
+      if (!assignee) return res.status(400).json({ error: 'Selected assignee must be an active company member', requestId: req.requestId });
+      normalizedAssigneeId = String(assignee.id);
+    }
+
+    const priority = priorityFor(normalizedImpact, normalizedUrgency);
+    const ticketNumber = await nextTicketNumber(type);
+    const id = await nextCounter('tickets');
+    const stamp = nowIso();
+    const initialStatus = normalizedAssigneeId ? 'ASSIGNED' : 'NEW';
+    await firestore.collection('tickets').doc(id).set({
+      ticket_number: ticketNumber,
+      type,
+      title: title.trim(),
+      description: String(description).slice(0, 20000),
+      status: initialStatus,
+      priority,
+      impact: normalizedImpact,
+      urgency: normalizedUrgency,
+      requester_id: String(req.session.userId),
+      assignee_id: normalizedAssigneeId,
+      assigned_team: assignee?.department || assignee?.job_title || null,
+      category,
+      due_at: null,
+      resolution: null,
+      created_by: String(req.session.userId),
+      updated_by: String(req.session.userId),
+      created_at: stamp,
+      updated_at: stamp,
+      resolved_at: null,
+      closed_at: null,
+    });
+    const historyId = await nextCounter('ticket_status_history');
+    await firestore.collection('tickets').doc(id).collection('history').doc(historyId).set({
+      from_status: null,
+      to_status: initialStatus,
+      actor_id: String(req.session.userId),
+      created_at: stamp,
+    });
+    await audit(req, 'TICKET_CREATED', 'ticket', id, null, { ticketNumber, type, priority, assigneeId: normalizedAssigneeId });
+    res.status(201).json({ ticket: await ticketForUser(req, id), requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.post('/api/v1/tickets/:id/worklogs', requireStaff, (req, res) => {
-  const ticket = ticketForUser(req, Number(req.params.id));
-  const { startedAt, endedAt, activity } = req.body || {};
-  const start = Date.parse(startedAt);
-  const end = Date.parse(endedAt);
-  if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || typeof activity !== 'string' || !activity.trim()) return res.status(400).json({ error: 'Valid times and activity are required', requestId: req.requestId });
-  const result = db.prepare('INSERT INTO ticket_work_logs (ticket_id, author_id, started_at, ended_at, activity) VALUES (?, ?, ?, ?, ?)').run(ticket.id, req.session.userId, new Date(start).toISOString(), new Date(end).toISOString(), activity.trim().slice(0, 4000));
-  audit(req, 'TICKET_WORKLOG_ADDED', 'ticket', ticket.id, null, { workLogId: result.lastInsertRowid });
-  res.status(201).json({ id: result.lastInsertRowid, requestId: req.requestId });
+app.get('/api/v1/tickets/:id', requireAuth, async (req, res, next) => {
+  try {
+    const ticket = await ticketForUser(req, req.params.id);
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
+
+    const [commentsSnap, historySnap, workLogsSnap] = await Promise.all([
+      firestore.collection('tickets').doc(String(ticket.id)).collection('comments').orderBy('created_at').get(),
+      firestore.collection('tickets').doc(String(ticket.id)).collection('history').orderBy('created_at').get(),
+      firestore.collection('tickets').doc(String(ticket.id)).collection('workLogs').orderBy('started_at').get(),
+    ]);
+
+    const comments = [];
+    for (const doc of commentsSnap.docs) {
+      const comment = { id: doc.id, ...doc.data() };
+      if (!isStaff(req) && comment.visibility !== 'PUBLIC') continue;
+      comments.push({
+        id: comment.id,
+        body: comment.body,
+        visibility: comment.visibility,
+        created_at: comment.created_at,
+        author: await usernameFor(comment.author_id),
+      });
+    }
+
+    const history = await Promise.all(historySnap.docs.map(async (doc) => {
+      const item = doc.data();
+      return {
+        from_status: item.from_status,
+        to_status: item.to_status,
+        created_at: item.created_at,
+        actor: await usernameFor(item.actor_id),
+      };
+    }));
+
+    const workLogs = await Promise.all(workLogsSnap.docs.map(async (doc) => {
+      const item = doc.data();
+      return {
+        started_at: item.started_at,
+        ended_at: item.ended_at,
+        activity: item.activity,
+        created_at: item.created_at,
+        author: await usernameFor(item.author_id),
+        regular_minutes: item.regular_minutes || 0,
+        overtime_minutes: item.overtime_minutes || 0,
+        total_minutes: item.total_minutes || 0,
+        is_overtime: Boolean(item.is_overtime),
+        shift_window: item.shift_window || 'Mon–Sat 09:00–17:00',
+      };
+    }));
+
+    res.json({ ticket, comments, history, workLogs, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/api/v1/audit-logs', requireRole('admin'), (req, res) => {
-  const rows = db.prepare(`SELECT a.id, a.action, a.resource, a.resource_id, a.result, a.request_id, a.created_at, u.username AS actor
-    FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id ORDER BY a.created_at DESC LIMIT 200`).all();
-  res.json({ auditLogs: rows, requestId: req.requestId });
+app.patch('/api/v1/tickets/:id', requireAuth, async (req, res, next) => {
+  try {
+    const ticket = await ticketForUser(req, req.params.id);
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
+    const nextStatus = req.body?.status;
+    if (!TICKET_STATUSES.has(nextStatus) || !STATUS_TRANSITIONS[ticket.status].includes(nextStatus)) {
+      return res.status(409).json({ error: `Invalid transition from ${ticket.status}`, requestId: req.requestId });
+    }
+    if (!isStaff(req) && nextStatus !== 'CLOSED' && nextStatus !== 'PENDING') {
+      return res.status(403).json({ error: 'Staff permission required', requestId: req.requestId });
+    }
+
+    const stamp = nowIso();
+    const update = {
+      status: nextStatus,
+      updated_by: String(req.session.userId),
+      updated_at: stamp,
+    };
+    if (nextStatus === 'RESOLVED') update.resolved_at = stamp;
+    if (nextStatus === 'CLOSED') update.closed_at = stamp;
+    await firestore.collection('tickets').doc(String(ticket.id)).update(update);
+
+    const historyId = await nextCounter('ticket_status_history');
+    await firestore.collection('tickets').doc(String(ticket.id)).collection('history').doc(historyId).set({
+      from_status: ticket.status,
+      to_status: nextStatus,
+      actor_id: String(req.session.userId),
+      created_at: stamp,
+    });
+
+    await audit(req, 'TICKET_STATUS_CHANGED', 'ticket', ticket.id, { status: ticket.status }, { status: nextStatus });
+    res.json({ ticket: await ticketForUser(req, ticket.id), requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
 });
 
-// ---------------------------------------------------------------------------
-// Auth routes
-// ---------------------------------------------------------------------------
-app.post('/api/login', authLimiter, async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+app.post('/api/v1/tickets/:id/comments', requireAuth, async (req, res, next) => {
+  try {
+    const ticket = await ticketForUser(req, req.params.id);
+    const { body, visibility = 'PUBLIC' } = req.body || {};
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
+    if (typeof body !== 'string' || body.trim().length < 1 || body.length > 10000) {
+      return res.status(400).json({ error: 'Comment is required', requestId: req.requestId });
+    }
+    if (!['PUBLIC', 'INTERNAL'].includes(visibility) || (visibility === 'INTERNAL' && !isStaff(req))) {
+      return res.status(403).json({ error: 'Internal notes require staff access', requestId: req.requestId });
+    }
+    const id = await nextCounter('ticket_comments');
+    await firestore.collection('tickets').doc(String(ticket.id)).collection('comments').doc(id).set({
+      author_id: String(req.session.userId),
+      body: body.trim(),
+      visibility,
+      created_at: nowIso(),
+    });
+    await audit(req, visibility === 'INTERNAL' ? 'TICKET_INTERNAL_NOTE_ADDED' : 'TICKET_COMMENT_ADDED', 'ticket', ticket.id, null, { commentId: id });
+    res.status(201).json({ id, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
+});
 
-  const user = getUserByUsername.get(username);
-  // Always run bcrypt.compare, even on unknown username, so response timing
-  // doesn't reveal whether the account exists.
-  const hashToCheck = user ? user.password_hash : '$2b$12$invalidsaltinvalidsaltinvalidsaltinvalidsaltinvalidsalt';
-  const ok = await bcrypt.compare(password, hashToCheck);
+app.post('/api/v1/tickets/:id/worklogs', requireStaff, async (req, res, next) => {
+  try {
+    const ticket = await ticketForUser(req, req.params.id);
+    const { startedAt, endedAt, activity } = req.body || {};
+    const start = Date.parse(startedAt);
+    const end = Date.parse(endedAt);
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found', requestId: req.requestId });
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || typeof activity !== 'string' || !activity.trim()) {
+      return res.status(400).json({ error: 'Valid times and activity are required', requestId: req.requestId });
+    }
+    const startedIso = new Date(start).toISOString();
+    const endedIso = new Date(end).toISOString();
+    const shift = analyzeWorkInterval(startedIso, endedIso);
+    const id = await nextCounter('ticket_work_logs');
+    await firestore.collection('tickets').doc(String(ticket.id)).collection('workLogs').doc(id).set({
+      author_id: String(req.session.userId),
+      started_at: startedIso,
+      ended_at: endedIso,
+      activity: activity.trim().slice(0, 4000),
+      created_at: nowIso(),
+      regular_minutes: shift.regular_minutes,
+      overtime_minutes: shift.overtime_minutes,
+      total_minutes: shift.total_minutes,
+      is_overtime: shift.is_overtime,
+      shift_timezone: shift.shift_timezone,
+      shift_window: shift.shift_window,
+    });
+    await audit(req, 'TICKET_WORKLOG_ADDED', 'ticket', ticket.id, null, {
+      workLogId: id,
+      regular_minutes: shift.regular_minutes,
+      overtime_minutes: shift.overtime_minutes,
+    });
+    res.status(201).json({ id, shift, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
+});
 
-  if (!user || !ok) return res.status(401).json({ error: 'Invalid credentials' });
-  if (user.account_status === 'PENDING') return res.status(403).json({ error: 'Your employee account is awaiting verification.' });
-  if (user.account_status === 'DISABLED') return res.status(403).json({ error: 'This account has been disabled.' });
+app.get('/api/v1/audit-logs', requireRole('admin'), async (req, res, next) => {
+  try {
+    const snap = await firestore.collection('audit_logs').get();
+    const auditLogs = (await Promise.all(snap.docs.map(async (doc) => {
+      const row = { id: doc.id, ...doc.data() };
+      return {
+        id: row.id,
+        action: row.action,
+        resource: row.resource,
+        resource_id: row.resource_id,
+        result: row.result,
+        request_id: row.request_id,
+        created_at: row.created_at,
+        actor: await usernameFor(row.actor_id),
+      };
+    })))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .slice(0, 200);
+    res.json({ auditLogs, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
+});
 
-  req.session.regenerate((err) => {
-    if (err) return res.status(500).json({ error: 'Login failed' });
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
-    req.session.accountType = user.account_type;
-    res.json({ user: publicUser(user) });
-  });
+app.post('/api/login', authLimiter, async (req, res, next) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    const user = await queryOne('users', 'username', username);
+    // Dummy hash keeps compare timing similar when the username is unknown.
+    const hashToCheck = user ? user.password_hash : '$2b$12$C6UzMDM.H6dfI/f/IKcEe.OwqQxqQxqQxqQxqQxqQxqQxqQxqQxqQ';
+    let ok = false;
+    try {
+      ok = await bcrypt.compare(password, hashToCheck);
+    } catch {
+      ok = false;
+    }
+
+    if (!user || !ok) return res.status(401).json({ error: 'Invalid credentials' });
+    if (user.account_status === 'PENDING') return res.status(403).json({ error: 'Your employee account is awaiting verification.' });
+    if (user.account_status === 'DISABLED') return res.status(403).json({ error: 'This account has been disabled.' });
+
+    req.session.regenerate((err) => {
+      if (err) return res.status(500).json({ error: 'Login failed' });
+      req.session.userId = user.id;
+      req.session.username = user.username;
+      req.session.role = user.role;
+      req.session.accountType = user.account_type;
+      res.json({ user: publicUser(user) });
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/logout', (req, res) => {
@@ -616,244 +667,528 @@ app.post('/api/logout', (req, res) => {
   });
 });
 
-app.get('/api/whoami', (req, res) => {
-  if (!req.session || !req.session.userId) return res.json({ user: null });
-  const user = db.prepare(`SELECT id, username, role, account_type, account_status, employee_id, customer_id,
-    full_name, email, phone, department, job_title, force_password_reset FROM users WHERE id = ?`).get(req.session.userId);
-  if (!user || user.account_status === 'DISABLED') return res.json({ user: null });
-  return res.json({ user: publicUser(user) });
-});
-
-// User management (admin)
-app.get('/api/users', requireRole('admin'), (req, res) => {
-  const rows = db.prepare(`SELECT id, username, role, account_type, account_status, employee_id, customer_id,
-    full_name, email, phone, department, job_title, verified_at FROM users ORDER BY id DESC`).all();
-  res.json(rows);
-});
-
-app.get('/api/users/invitations', requireRole('admin'), (req, res) => {
-  const invitations = db.prepare(`SELECT id, reference_code, invited_name, invited_email, admin_access, status, created_at, used_at
-    FROM team_invitations ORDER BY id DESC LIMIT 100`).all();
-  res.json(invitations);
-});
-
-app.post('/api/users/invitations', requireRole('admin'), (req, res) => {
-  const { invitedName = '', invitedEmail = '', adminAccess = false } = req.body || {};
-  if (typeof invitedName !== 'string' || invitedName.length > 120 || typeof invitedEmail !== 'string' || invitedEmail.length > 160) {
-    return res.status(400).json({ error: 'Invalid team member details' });
-  }
-  if (invitedEmail && !/^\S+@\S+\.\S+$/.test(invitedEmail)) return res.status(400).json({ error: 'Enter a valid email address' });
-  const referenceCode = createTeamReference();
-  db.prepare(`INSERT INTO team_invitations (reference_code, invited_name, invited_email, admin_access, created_by)
-    VALUES (?, ?, ?, ?, ?)`).run(referenceCode, invitedName.trim() || null, invitedEmail.trim().toLowerCase() || null, adminAccess ? 1 : 0, req.session.userId);
-  audit(req, 'TEAM_INVITATION_CREATED', 'team_invitation', referenceCode, null, { adminAccess: Boolean(adminAccess) });
-  res.status(201).json({ ok: true, referenceCode, adminAccess: Boolean(adminAccess) });
-});
-
-app.patch('/api/users/:id/verification', requireRole('admin'), (req, res) => {
-  const userId = Number(req.params.id);
-  const { status } = req.body || {};
-  if (!Number.isInteger(userId) || !['ACTIVE', 'DISABLED'].includes(status)) return res.status(400).json({ error: 'Invalid verification update' });
-  const target = db.prepare('SELECT id, account_type, account_status FROM users WHERE id = ?').get(userId);
-  if (!target) return res.status(404).json({ error: 'User not found' });
-  db.prepare(`UPDATE users SET account_status = ?, verified_at = CASE WHEN ? = 'ACTIVE' THEN CURRENT_TIMESTAMP ELSE verified_at END,
-    approved_by = CASE WHEN ? = 'ACTIVE' THEN ? ELSE approved_by END WHERE id = ?`).run(status, status, status, req.session.userId, userId);
-  audit(req, status === 'ACTIVE' ? 'EMPLOYEE_VERIFIED' : 'ACCOUNT_DISABLED', 'user', userId, { status: target.account_status }, { status });
-  res.json({ ok: true, status });
-});
-
-app.patch('/api/users/:id/admin-access', requireRole('admin'), (req, res) => {
-  const userId = Number(req.params.id);
-  const target = db.prepare('SELECT id, role, account_type, account_status FROM users WHERE id = ?').get(userId);
-  if (!target || target.account_type !== 'EMPLOYEE' || target.account_status !== 'ACTIVE') return res.status(400).json({ error: 'Only verified employees can receive admin access' });
-  db.prepare("UPDATE users SET role = 'admin', account_type = 'ADMIN' WHERE id = ?").run(userId);
-  audit(req, 'ADMIN_ACCESS_GRANTED', 'user', userId, { role: target.role }, { role: 'admin' });
-  res.json({ ok: true });
-});
-
-app.post('/api/users', requireRole('admin'), async (req, res) => {
-  const { username, password, role } = req.body || {};
-  if (!isValidUsername(username)) {
-    return res.status(400).json({ error: 'Username must be 3-32 chars: letters, numbers, _ . -' });
-  }
-  if (!isValidPassword(password)) {
-    return res.status(400).json({ error: 'Password must be 8+ chars with a letter and a number' });
-  }
-  const safeRole = role === 'admin' ? 'admin' : 'employee';
-  const hash = await bcrypt.hash(password, 12);
+app.get('/api/whoami', async (req, res, next) => {
   try {
-    const result = db.prepare(`INSERT INTO users
-      (username, password_hash, role, account_type, account_status, employee_id, full_name)
-      VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)`).run(username, hash, safeRole, safeRole === 'admin' ? 'ADMIN' : 'EMPLOYEE', safeRole === 'admin' ? null : identityId('EMP'), username);
-    audit(req, 'ACCOUNT_CREATED_BY_ADMIN', 'user', result.lastInsertRowid, null, { role: safeRole });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ error: 'User exists or invalid' });
+    if (!req.session?.userId) return res.json({ user: null });
+    const user = await getDoc('users', req.session.userId);
+    if (!user || user.account_status === 'DISABLED') return res.json({ user: null });
+    return res.json({ user: publicUser(user) });
+  } catch (error) {
+    next(error);
   }
 });
 
-app.delete('/api/users/:id', requireRole('admin'), (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
-  // Don't allow an admin to delete their own account by accident/self-lockout.
-  if (id === req.session.userId) {
-    return res.status(400).json({ error: 'Cannot delete your own account while logged in' });
+app.get('/api/users', requireRole('admin'), async (req, res, next) => {
+  try {
+    const snap = await firestore.collection('users').get();
+    const rows = snap.docs
+      .map((doc) => {
+        const user = { id: doc.id, ...doc.data() };
+        return {
+          id: user.id,
+          username: user.username,
+          role: user.role,
+          account_type: user.account_type,
+          account_status: user.account_status,
+          employee_id: user.employee_id,
+          customer_id: user.customer_id,
+          full_name: user.full_name,
+          email: user.email,
+          phone: user.phone,
+          department: user.department,
+          job_title: user.job_title,
+          verified_at: user.verified_at,
+        };
+      })
+      .sort((a, b) => String(b.id).localeCompare(String(a.id), undefined, { numeric: true }));
+    res.json(rows);
+  } catch (error) {
+    next(error);
   }
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
-  res.json({ ok: true });
 });
 
-app.post('/api/register/identity-preview', identityPreviewLimiter, (req, res) => {
-  const { accountType = 'CLIENT', nicNumber } = req.body || {};
-  const birthYear = extractBirthYear(nicNumber);
-  if (!['CLIENT', 'EMPLOYEE'].includes(accountType) || !birthYear) {
-    return res.status(400).json({ error: 'Enter a NIC beginning with a valid four-digit birth year' });
+app.get('/api/users/invitations', requireRole('admin'), async (req, res, next) => {
+  try {
+    const snap = await firestore.collection('team_invitations').get();
+    const invitations = snap.docs
+      .map((doc) => ({ id: doc.id, ...doc.data() }))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .slice(0, 100)
+      .map((invite) => ({
+        id: invite.id,
+        reference_code: invite.reference_code,
+        invited_name: invite.invited_name,
+        invited_email: invite.invited_email,
+        admin_access: invite.admin_access,
+        status: invite.status,
+        created_at: invite.created_at,
+        used_at: invite.used_at,
+      }));
+    res.json(invitations);
+  } catch (error) {
+    next(error);
   }
-  const id = createRecognizedIdentity(accountType, birthYear);
-  req.session.registrationIdentity = { id, accountType, birthYear };
-  res.json({ id });
 });
 
-// Public registration endpoint - create an employee account
-app.post('/api/register', authLimiter, async (req, res) => {
-  const { password, accountType = 'CLIENT', fullName, email, phone, department, jobTitle, location, shopName, nicNumber, referenceCode } = req.body || {};
-  if (!isValidPassword(password)) {
-    return res.status(400).json({ error: 'Password must be 8+ chars with a letter and a number' });
-  }
-  if (!['CLIENT', 'EMPLOYEE'].includes(accountType)) {
-    return res.status(400).json({ error: 'Choose a client or employee account' });
-  }
-  const birthYear = extractBirthYear(nicNumber);
-  if (!birthYear) return res.status(400).json({ error: 'NIC must begin with a four-digit birth year, for example 2004...' });
-  let invitation = null;
-  if (accountType === 'EMPLOYEE') {
-    if (typeof referenceCode !== 'string' || !/^ANZ-TEAM-[A-F0-9]{10}$/.test(referenceCode.trim().toUpperCase())) {
-      return res.status(400).json({ error: 'A valid team reference code is required for employee registration' });
+app.post('/api/users/invitations', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { invitedName = '', invitedEmail = '', adminAccess = false } = req.body || {};
+    if (typeof invitedName !== 'string' || invitedName.length > 120 || typeof invitedEmail !== 'string' || invitedEmail.length > 160) {
+      return res.status(400).json({ error: 'Invalid team member details' });
     }
-    invitation = db.prepare("SELECT id, admin_access, status FROM team_invitations WHERE reference_code = ?").get(referenceCode.trim().toUpperCase());
-    if (!invitation || invitation.status !== 'AVAILABLE') return res.status(403).json({ error: 'That team reference code is invalid or has already been used' });
+    if (invitedEmail && !/^\S+@\S+\.\S+$/.test(invitedEmail)) return res.status(400).json({ error: 'Enter a valid email address' });
+    const referenceCode = await createTeamReference();
+    const id = await nextCounter('team_invitations');
+    await firestore.collection('team_invitations').doc(id).set({
+      reference_code: referenceCode,
+      invited_name: invitedName.trim() || null,
+      invited_email: invitedEmail.trim().toLowerCase() || null,
+      admin_access: adminAccess ? 1 : 0,
+      status: 'AVAILABLE',
+      created_by: String(req.session.userId),
+      used_by: null,
+      created_at: nowIso(),
+      used_at: null,
+    });
+    await audit(req, 'TEAM_INVITATION_CREATED', 'team_invitation', referenceCode, null, { adminAccess: Boolean(adminAccess) });
+    res.status(201).json({ ok: true, referenceCode, adminAccess: Boolean(adminAccess) });
+  } catch (error) {
+    next(error);
   }
-  if (typeof fullName !== 'string' || fullName.trim().length < 2 || fullName.length > 120) {
-    return res.status(400).json({ error: 'Full name is required' });
-  }
-  if (typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email) || email.length > 160) {
-    return res.status(400).json({ error: 'A valid email is required' });
-  }
-  if (accountType === 'CLIENT' && (typeof location !== 'string' || location.trim().length < 2 || location.length > 160 || typeof shopName !== 'string' || shopName.trim().length < 2 || shopName.length > 160)) {
-    return res.status(400).json({ error: 'Location and shop/workspace name are required for clients' });
-  }
+});
 
-  const hash = await bcrypt.hash(password, 12);
+app.patch('/api/users/:id/verification', requireRole('admin'), async (req, res, next) => {
   try {
+    const userId = String(req.params.id);
+    const { status } = req.body || {};
+    if (!['ACTIVE', 'DISABLED'].includes(status)) return res.status(400).json({ error: 'Invalid verification update' });
+    const target = await getDoc('users', userId);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    const update = { account_status: status };
+    if (status === 'ACTIVE') {
+      update.verified_at = nowIso();
+      update.approved_by = String(req.session.userId);
+      if (target.pending_admin_access) {
+        update.role = 'admin';
+        update.account_type = 'ADMIN';
+        update.pending_admin_access = 0;
+      }
+    }
+    await firestore.collection('users').doc(userId).update(update);
+    await audit(req, status === 'ACTIVE' ? 'EMPLOYEE_VERIFIED' : 'ACCOUNT_DISABLED', 'user', userId, { status: target.account_status }, {
+      status,
+      role: update.role || target.role,
+      account_type: update.account_type || target.account_type,
+    });
+    res.json({ ok: true, status, role: update.role || target.role, accountType: update.account_type || target.account_type });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/users/:id/admin-access', requireRole('admin'), async (req, res, next) => {
+  try {
+    const userId = String(req.params.id);
+    const target = await getDoc('users', userId);
+    if (!target || target.account_type !== 'EMPLOYEE' || target.account_status !== 'ACTIVE') {
+      return res.status(400).json({ error: 'Only verified employees can receive admin access' });
+    }
+    await firestore.collection('users').doc(userId).update({ role: 'admin', account_type: 'ADMIN' });
+    await audit(req, 'ADMIN_ACCESS_GRANTED', 'user', userId, { role: target.role }, { role: 'admin' });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/users', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { username, password, role } = req.body || {};
+    if (!isValidUsername(username)) {
+      return res.status(400).json({ error: 'Username must be 3-32 chars: letters, numbers, _ . -' });
+    }
+    if (!isValidPassword(password)) {
+      return res.status(400).json({ error: 'Password must be 8+ chars with a letter and a number' });
+    }
+    const existing = await queryOne('users', 'username', username);
+    if (existing) return res.status(400).json({ error: 'User exists or invalid' });
+
+    const safeRole = role === 'admin' ? 'admin' : 'employee';
+    const hash = await bcrypt.hash(password, 12);
+    const id = await nextCounter('users');
+    await firestore.collection('users').doc(id).set({
+      username,
+      password_hash: hash,
+      role: safeRole,
+      account_type: safeRole === 'admin' ? 'ADMIN' : 'EMPLOYEE',
+      account_status: 'ACTIVE',
+      employee_id: safeRole === 'admin' ? null : identityId('EMP'),
+      customer_id: null,
+      full_name: username,
+      email: null,
+      phone: null,
+      department: null,
+      job_title: null,
+      location: null,
+      shop_name: null,
+      linkedin_url: null,
+      instagram_url: null,
+      whatsapp_url: null,
+      github_url: null,
+      verified_at: nowIso(),
+      approved_by: String(req.session.userId),
+      force_password_reset: 0,
+      created_at: nowIso(),
+    });
+    await audit(req, 'ACCOUNT_CREATED_BY_ADMIN', 'user', id, null, { role: safeRole });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/users/:id', requireRole('admin'), async (req, res, next) => {
+  try {
+    const id = String(req.params.id);
+    if (id === String(req.session.userId)) {
+      return res.status(400).json({ error: 'Cannot delete your own account while logged in' });
+    }
+    await firestore.collection('users').doc(id).delete();
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/register/identity-preview', identityPreviewLimiter, async (req, res, next) => {
+  try {
+    const { accountType = 'CLIENT', nicNumber } = req.body || {};
+    const birthYear = extractBirthYear(nicNumber);
+    if (!['CLIENT', 'EMPLOYEE'].includes(accountType) || !birthYear) {
+      return res.status(400).json({ error: 'Enter a NIC beginning with a valid four-digit birth year' });
+    }
+    const id = await createRecognizedIdentity(accountType, birthYear);
+    req.session.registrationIdentity = { id, accountType, birthYear };
+    res.json({ id });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/register', authLimiter, async (req, res, next) => {
+  try {
+    const {
+      password, accountType = 'CLIENT', fullName, email, phone, department, jobTitle,
+      location, shopName, nicNumber, referenceCode,
+    } = req.body || {};
+    if (!isValidPassword(password)) {
+      return res.status(400).json({ error: 'Password must be 8+ chars with a letter and a number' });
+    }
+    if (!['CLIENT', 'EMPLOYEE'].includes(accountType)) {
+      return res.status(400).json({ error: 'Choose a client or employee account' });
+    }
+    const birthYear = extractBirthYear(nicNumber);
+    if (!birthYear) return res.status(400).json({ error: 'NIC must begin with a four-digit birth year, for example 2004...' });
+
+    let invitation = null;
+    if (accountType === 'EMPLOYEE') {
+      if (typeof referenceCode !== 'string' || !/^ANZ-TEAM-[A-F0-9]{10}$/.test(referenceCode.trim().toUpperCase())) {
+        return res.status(400).json({ error: 'A valid team reference code is required for employee registration' });
+      }
+      invitation = await queryOne('team_invitations', 'reference_code', referenceCode.trim().toUpperCase());
+      if (!invitation || invitation.status !== 'AVAILABLE') {
+        return res.status(403).json({ error: 'That team reference code is invalid or has already been used' });
+      }
+    }
+    if (typeof fullName !== 'string' || fullName.trim().length < 2 || fullName.length > 120) {
+      return res.status(400).json({ error: 'Full name is required' });
+    }
+    if (typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email) || email.length > 160) {
+      return res.status(400).json({ error: 'A valid email is required' });
+    }
+    if (accountType === 'CLIENT' && (typeof location !== 'string' || location.trim().length < 2 || location.length > 160 || typeof shopName !== 'string' || shopName.trim().length < 2 || shopName.length > 160)) {
+      return res.status(400).json({ error: 'Location and shop/workspace name are required for clients' });
+    }
+
+    const hash = await bcrypt.hash(password, 12);
     const isEmployee = accountType === 'EMPLOYEE';
     const reserved = req.session.registrationIdentity;
     const username = reserved && reserved.accountType === accountType && reserved.birthYear === birthYear
       ? reserved.id
-      : createRecognizedIdentity(accountType, birthYear);
+      : await createRecognizedIdentity(accountType, birthYear);
     const employeeId = isEmployee ? username : null;
     const customerId = isEmployee ? null : username;
-    const status = isEmployee ? 'ACTIVE' : 'ACTIVE';
-    const role = isEmployee && invitation.admin_access ? 'admin' : isEmployee ? 'employee' : 'client';
-    const registeredAccountType = isEmployee && invitation.admin_access ? 'ADMIN' : accountType;
-    const result = db.prepare(`INSERT INTO users
-      (username, password_hash, role, account_type, account_status, employee_id, customer_id, full_name, email, phone, department, job_title, location, shop_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(username, hash, role, registeredAccountType, status, employeeId, customerId, fullName.trim(), email.trim().toLowerCase(), phone || null, isEmployee ? department || null : null, isEmployee ? jobTitle || null : null, location || null, shopName || null);
-    if (invitation) db.prepare("UPDATE team_invitations SET status = 'USED', used_by = ?, used_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'AVAILABLE'").run(result.lastInsertRowid, invitation.id);
+    // Employees stay PENDING until a system admin verifies them.
+    // Admin-access invites are applied only after verification.
+    const pendingAdminAccess = Boolean(isEmployee && invitation?.admin_access);
+    const role = isEmployee ? 'employee' : 'client';
+    const registeredAccountType = isEmployee ? 'EMPLOYEE' : 'CLIENT';
+    const accountStatus = isEmployee ? 'PENDING' : 'ACTIVE';
+    const id = await nextCounter('users');
+
+    try {
+      await firestore.collection('users').doc(id).set({
+        username,
+        password_hash: hash,
+        role,
+        account_type: registeredAccountType,
+        account_status: accountStatus,
+        pending_admin_access: pendingAdminAccess ? 1 : 0,
+        employee_id: employeeId,
+        customer_id: customerId,
+        full_name: fullName.trim(),
+        email: email.trim().toLowerCase(),
+        phone: phone || null,
+        department: isEmployee ? department || null : null,
+        job_title: isEmployee ? jobTitle || null : null,
+        location: location || null,
+        shop_name: shopName || null,
+        linkedin_url: null,
+        instagram_url: null,
+        whatsapp_url: null,
+        github_url: null,
+        verified_at: isEmployee ? null : nowIso(),
+        approved_by: null,
+        force_password_reset: 0,
+        created_at: nowIso(),
+      });
+    } catch (error) {
+      if (String(error.message || '').includes('already exists')) {
+        return res.status(409).json({ error: 'That generated identity is already in use. Please submit again.' });
+      }
+      throw error;
+    }
+
+    const usernameClash = await firestore.collection('users').where('username', '==', username).get();
+    if (usernameClash.size > 1) {
+      await firestore.collection('users').doc(id).delete();
+      return res.status(409).json({ error: 'That generated identity is already in use. Please submit again.' });
+    }
+
+    if (invitation) {
+      await firestore.collection('team_invitations').doc(String(invitation.id)).update({
+        status: 'USED',
+        used_by: id,
+        used_at: nowIso(),
+      });
+    }
     delete req.session.registrationIdentity;
-    audit(req, 'ACCOUNT_REGISTERED', 'user', result.lastInsertRowid, null, { accountType: registeredAccountType, employeeId, customerId, status });
-    return res.status(201).json({ ok: true, username, accountType: registeredAccountType, employeeId, customerId, status });
-  } catch (e) {
-    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'That generated identity is already in use. Please submit again.' });
-    console.error('Registration failed:', e.code || 'unknown database error');
+    await audit(req, 'ACCOUNT_REGISTERED', 'user', id, null, {
+      accountType: registeredAccountType,
+      employeeId,
+      customerId,
+      status: accountStatus,
+      pendingAdminAccess,
+    });
+    return res.status(201).json({
+      ok: true,
+      username,
+      accountType: registeredAccountType,
+      employeeId,
+      customerId,
+      status: accountStatus,
+      requiresVerification: isEmployee,
+    });
+  } catch (error) {
+    console.error('Registration failed:', error.code || error.message || 'unknown error');
     return res.status(500).json({ error: 'We could not create the account. Please try again.', requestId: req.requestId });
   }
 });
 
-// Change password for authenticated user
-app.post('/api/users/change-password', requireAuth, authLimiter, async (req, res) => {
-  const { currentPassword, newPassword } = req.body || {};
-  if (!currentPassword || !isValidPassword(newPassword)) {
-    return res.status(400).json({ error: 'New password must be 8+ chars with a letter and a number' });
+app.post('/api/users/change-password', requireAuth, authLimiter, async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !isValidPassword(newPassword)) {
+      return res.status(400).json({ error: 'New password must be 8+ chars with a letter and a number' });
+    }
+    const userRow = await getDoc('users', req.session.userId);
+    if (!userRow) return res.status(401).json({ error: 'Unauthorized' });
+    const ok = await bcrypt.compare(currentPassword, userRow.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid current password' });
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await firestore.collection('users').doc(String(req.session.userId)).update({ password_hash: newHash });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
   }
-
-  const userRow = db.prepare('SELECT id, password_hash FROM users WHERE id = ?').get(req.session.userId);
-  if (!userRow) return res.status(401).json({ error: 'Unauthorized' });
-
-  const ok = await bcrypt.compare(currentPassword, userRow.password_hash);
-  if (!ok) return res.status(401).json({ error: 'Invalid current password' });
-
-  const newHash = await bcrypt.hash(newPassword, 12);
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, req.session.userId);
-  res.json({ ok: true });
 });
 
-// Employee endpoints for reports
-app.get('/api/reports', requireAuth, (req, res) => {
-  const rows = isStaff(req)
-    ? db.prepare(`SELECT r.id, r.user_id, r.content, r.created_at, u.username, u.full_name, u.employee_id
-      FROM reports r JOIN users u ON u.id = r.user_id ORDER BY r.created_at DESC`).all()
-    : db.prepare('SELECT id, user_id, content, created_at FROM reports WHERE user_id = ? ORDER BY created_at DESC').all(req.session.userId);
-  res.json(rows);
-});
-
-app.post('/api/reports', requireAuth, (req, res) => {
-  const { content } = req.body || {};
-  if (!content || typeof content !== 'string' || content.length > 20000) {
-    return res.status(400).json({ error: 'Missing or invalid content' });
+app.get('/api/reports', requireAuth, async (req, res, next) => {
+  try {
+    const snap = isStaff(req)
+      ? await firestore.collection('reports').get()
+      : await firestore.collection('reports').where('user_id', '==', String(req.session.userId)).get();
+    let rows = await Promise.all(snap.docs.map(async (doc) => {
+      const report = { id: doc.id, ...doc.data() };
+      if (!isStaff(req)) {
+        return { id: report.id, user_id: report.user_id, content: report.content, created_at: report.created_at };
+      }
+      const user = await getDoc('users', report.user_id);
+      return {
+        id: report.id,
+        user_id: report.user_id,
+        content: report.content,
+        created_at: report.created_at,
+        username: user?.username,
+        full_name: user?.full_name,
+        employee_id: user?.employee_id,
+      };
+    }));
+    rows = rows.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    res.json(rows);
+  } catch (error) {
+    next(error);
   }
-  db.prepare('INSERT INTO reports (user_id, content) VALUES (?, ?)').run(req.session.userId, content);
-  audit(req, 'DAILY_REPORT_SUBMITTED', 'report', null, null, { length: content.length });
-  res.json({ ok: true });
 });
 
-app.get('/api/v1/reports/management', requireStaff, (req, res) => {
-  const rows = db.prepare(`SELECT r.id, r.content, r.created_at, u.username, u.full_name, u.employee_id
-    FROM reports r JOIN users u ON u.id = r.user_id ORDER BY r.created_at DESC LIMIT 100`).all();
-  res.json({ reports: rows, requestId: req.requestId });
-});
-
-app.get('/api/v1/profile', requireAuth, (req, res) => {
-  const user = db.prepare(`SELECT id, username, role, account_type, account_status, employee_id, customer_id,
-    full_name, email, phone, department, job_title, location, shop_name, linkedin_url, instagram_url, whatsapp_url, github_url, verified_at
-    FROM users WHERE id = ?`).get(req.session.userId);
-  const tickets = db.prepare(`SELECT ticket_number, title, status, priority, created_at, updated_at
-    FROM tickets WHERE requester_id = ? OR assignee_id = ? ORDER BY updated_at DESC LIMIT 50`).all(req.session.userId, req.session.userId);
-  const reports = db.prepare(`SELECT id, created_at FROM reports WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`).all(req.session.userId);
-  const auditEvents = db.prepare(`SELECT action, resource, resource_id, created_at FROM audit_logs
-    WHERE actor_id = ? ORDER BY created_at DESC LIMIT 20`).all(req.session.userId);
-  res.json({ user: publicUser(user), timeline: { tickets, reports, auditEvents }, requestId: req.requestId });
-});
-
-app.patch('/api/v1/profile', requireAuth, (req, res) => {
-  const { fullName, email, phone, department, jobTitle, location, shopName, linkedinUrl, instagramUrl, whatsappUrl, githubUrl } = req.body || {};
-  if (typeof fullName !== 'string' || fullName.trim().length < 2 || fullName.length > 120 || typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email)) {
-    return res.status(400).json({ error: 'Full name and valid email are required', requestId: req.requestId });
+app.post('/api/reports', requireAuth, async (req, res, next) => {
+  try {
+    const { content } = req.body || {};
+    if (!content || typeof content !== 'string' || content.length > 20000) {
+      return res.status(400).json({ error: 'Missing or invalid content' });
+    }
+    const id = await nextCounter('reports');
+    await firestore.collection('reports').doc(id).set({
+      user_id: String(req.session.userId),
+      content,
+      created_at: nowIso(),
+    });
+    await audit(req, 'DAILY_REPORT_SUBMITTED', 'report', id, null, { length: content.length });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
   }
-  const links = { linkedinUrl, instagramUrl, whatsappUrl, githubUrl };
-  for (const [name, value] of Object.entries(links)) {
-    if (value && (typeof value !== 'string' || value.length > 300 || !/^https:\/\//i.test(value))) return res.status(400).json({ error: `${name} must be an HTTPS link`, requestId: req.requestId });
-  }
-  const before = db.prepare('SELECT full_name, email, phone, department, job_title, linkedin_url, instagram_url, whatsapp_url, github_url FROM users WHERE id = ?').get(req.session.userId);
-  db.prepare(`UPDATE users SET full_name = ?, email = ?, phone = ?, department = ?, job_title = ?, location = ?, shop_name = ?,
-    linkedin_url = ?, instagram_url = ?, whatsapp_url = ?, github_url = ? WHERE id = ?`).run(fullName.trim(), email.trim().toLowerCase(), phone || null, department || null, jobTitle || null, location || null, shopName || null, linkedinUrl || null, instagramUrl || null, whatsappUrl || null, githubUrl || null, req.session.userId);
-  audit(req, 'PROFILE_UPDATED', 'user', req.session.userId, before, links);
-  res.json({ ok: true, requestId: req.requestId });
 });
 
-// ---------------------------------------------------------------------------
-// Serve ONLY the public/ directory. Server code, package.json, and the
-// data/ directory (databases, sessions) are never web-servable.
-// ---------------------------------------------------------------------------
+app.get('/api/v1/reports/management', requireStaff, async (req, res, next) => {
+  try {
+    const snap = await firestore.collection('reports').get();
+    const reports = (await Promise.all(snap.docs.map(async (doc) => {
+      const report = { id: doc.id, ...doc.data() };
+      const user = await getDoc('users', report.user_id);
+      return {
+        id: report.id,
+        content: report.content,
+        created_at: report.created_at,
+        username: user?.username,
+        full_name: user?.full_name,
+        employee_id: user?.employee_id,
+      };
+    })))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .slice(0, 100);
+    res.json({ reports, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/v1/profile', requireAuth, async (req, res, next) => {
+  try {
+    const user = await getDoc('users', req.session.userId);
+    const ticketsSnap = await firestore.collection('tickets').get();
+    const tickets = ticketsSnap.docs
+      .map((doc) => ({ id: doc.id, ...doc.data() }))
+      .filter((ticket) => String(ticket.requester_id) === String(req.session.userId) || String(ticket.assignee_id) === String(req.session.userId))
+      .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+      .slice(0, 50)
+      .map(({ ticket_number, title, status, priority, created_at, updated_at }) => ({
+        ticket_number, title, status, priority, created_at, updated_at,
+      }));
+    const reportsSnap = await firestore.collection('reports').where('user_id', '==', String(req.session.userId)).get();
+    const reports = reportsSnap.docs
+      .map((doc) => ({ id: doc.id, created_at: doc.data().created_at }))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .slice(0, 20);
+    const auditSnap = await firestore.collection('audit_logs').where('actor_id', '==', String(req.session.userId)).get();
+    const auditEvents = auditSnap.docs
+      .map((doc) => {
+        const item = doc.data();
+        return { action: item.action, resource: item.resource, resource_id: item.resource_id, created_at: item.created_at };
+      })
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .slice(0, 20);
+    res.json({ user: publicUser(user), timeline: { tickets, reports, auditEvents }, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/v1/profile', requireAuth, async (req, res, next) => {
+  try {
+    const { fullName, email, phone, department, jobTitle, location, shopName, linkedinUrl, instagramUrl, whatsappUrl, githubUrl } = req.body || {};
+    if (typeof fullName !== 'string' || fullName.trim().length < 2 || fullName.length > 120 || typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email)) {
+      return res.status(400).json({ error: 'Full name and valid email are required', requestId: req.requestId });
+    }
+    const links = { linkedinUrl, instagramUrl, whatsappUrl, githubUrl };
+    for (const [name, value] of Object.entries(links)) {
+      if (value && (typeof value !== 'string' || value.length > 300 || !/^https:\/\//i.test(value))) {
+        return res.status(400).json({ error: `${name} must be an HTTPS link`, requestId: req.requestId });
+      }
+    }
+    const before = await getDoc('users', req.session.userId);
+    await firestore.collection('users').doc(String(req.session.userId)).update({
+      full_name: fullName.trim(),
+      email: email.trim().toLowerCase(),
+      phone: phone || null,
+      department: department || null,
+      job_title: jobTitle || null,
+      location: location || null,
+      shop_name: shopName || null,
+      linkedin_url: linkedinUrl || null,
+      instagram_url: instagramUrl || null,
+      whatsapp_url: whatsappUrl || null,
+      github_url: githubUrl || null,
+    });
+    await audit(req, 'PROFILE_UPDATED', 'user', req.session.userId, {
+      full_name: before.full_name,
+      email: before.email,
+      phone: before.phone,
+      department: before.department,
+      job_title: before.job_title,
+      linkedin_url: before.linkedin_url,
+      instagram_url: before.instagram_url,
+      whatsapp_url: before.whatsapp_url,
+      github_url: before.github_url,
+    }, links);
+    res.json({ ok: true, requestId: req.requestId });
+  } catch (error) {
+    next(error);
+  }
+});
+
+registerOperations(app, {
+  firestore,
+  nextCounter,
+  getDoc,
+  requireAuth,
+  requireStaff,
+  requireRole,
+  isStaff,
+  audit,
+  nowIso,
+  ticketForUser,
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
-// CSRF errors -> clean 403 instead of a stack trace.
 app.use((err, req, res, next) => {
   if (err.code === 'EBADCSRFTOKEN') {
     return res.status(403).json({ error: 'Invalid or missing CSRF token' });
   }
-  next(err);
+  console.error(`[${req.requestId || 'no-req'}]`, err);
+  if (res.headersSent) return next(err);
+  return res.status(500).json({ error: 'Internal server error', requestId: req.requestId });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+seedAdminIfNeeded()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running on http://localhost:${PORT} (Firestore)`);
+      startChatRetentionScheduler(firestore);
+    });
+  })
+  .catch((error) => {
+    console.error('FATAL: could not initialize Firestore seed:', error);
+    process.exit(1);
+  });

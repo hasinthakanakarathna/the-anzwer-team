@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ticket | ANZWER Operations</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="app-body">
+    <div class="app-layout">
+      <aside class="sidebar">
+        <a class="brand" href="index.html"><span class="brand-mark">A</span><span><strong>ANZWER</strong><small>Ticket</small></span></a>
+        <nav class="main-nav" id="ticketNav">
+          <a href="index.html">Overview</a>
+          <a class="active" href="tickets.html">Ticket desk</a>
+          <a href="reports.html">Daily reports</a>
+          <a href="profile.html">My profile</a>
+        </nav>
+        <div class="sidebar-foot">TICKET DETAIL<br /><span>STATUS / NOTES / WORK</span></div>
+      </aside>
+      <main class="page-content">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow"><a id="backLink" class="crumb" href="tickets.html">← Back to queue</a></p>
+            <h1 id="ticketHeading">Loading ticket…</h1>
+            <p class="lede" id="ticketSubheading">Pulling the latest status, notes, and work log.</p>
+          </div>
+          <div class="user-area">
+            <span id="employeeDisplay">Loading session...</span>
+            <button id="logoutButton" class="button-secondary" type="button">Log out</button>
+          </div>
+        </header>
+
+        <p id="pageMessage" class="form-message hidden"></p>
+
+        <section id="ticketDetail" class="ticket-detail hidden">
+          <div class="ticket-detail-grid">
+            <section class="panel ticket-main">
+              <div class="toolbar">
+                <div>
+                  <p class="eyebrow" id="ticketMeta">Ticket</p>
+                  <h2 id="ticketTitle">—</h2>
+                </div>
+                <div class="ticket-badges">
+                  <span class="badge" id="ticketStatus">—</span>
+                  <span class="priority" id="ticketPriority">—</span>
+                </div>
+              </div>
+              <div class="ticket-body">
+                <p class="form-note">Description</p>
+                <pre id="ticketDescription" class="ticket-description"></pre>
+                <dl class="ticket-facts">
+                  <div><dt>Requester</dt><dd id="ticketRequester">—</dd></div>
+                  <div><dt>Assignee</dt><dd id="ticketAssignee">—</dd></div>
+                  <div><dt>Opened</dt><dd id="ticketOpened">—</dd></div>
+                  <div><dt>Updated</dt><dd id="ticketUpdated">—</dd></div>
+                </dl>
+              </div>
+            </section>
+
+            <aside class="ticket-side">
+              <section class="panel create-panel">
+                <p class="eyebrow">Lifecycle</p>
+                <h2>Update status</h2>
+                <p class="form-note" id="statusHint">Choose the next allowed state for this ticket.</p>
+                <form id="statusForm" class="stack-form">
+                  <select id="nextStatus" class="field" required></select>
+                  <button class="button-primary" type="submit">Apply status <span>→</span></button>
+                  <p id="statusMessage" class="form-message hidden"></p>
+                </form>
+              </section>
+
+              <section class="panel create-panel" id="assignPanel">
+                <p class="eyebrow">Admin only</p>
+                <h2>Assign by role</h2>
+                <p class="form-note">Route this ticket to an active employee. Optional role filter narrows the list.</p>
+                <form id="assignForm" class="stack-form">
+                  <select id="assignRoleFilter" class="field"><option value="">All roles</option></select>
+                  <select id="assignEmployee" class="field" required><option value="">Select employee</option></select>
+                  <button class="button-secondary" type="submit">Assign ticket</button>
+                  <p id="assignMessage" class="form-message hidden"></p>
+                </form>
+              </section>
+
+              <section class="panel create-panel" id="worklogPanel">
+                <p class="eyebrow">Staff only</p>
+                <h2>Log work</h2>
+                <p class="form-note">Record time spent against this ticket.</p>
+                <form id="worklogForm" class="stack-form">
+                  <label>Started<input id="workStarted" class="field" type="datetime-local" required /></label>
+                  <label>Ended<input id="workEnded" class="field" type="datetime-local" required /></label>
+                  <label>Activity<textarea id="workActivity" class="field large-field" maxlength="4000" required placeholder="What did you do?"></textarea></label>
+                  <button class="button-secondary" type="submit">Add work log</button>
+                  <p id="worklogMessage" class="form-message hidden"></p>
+                </form>
+              </section>
+            </aside>
+          </div>
+
+          <div class="ticket-streams">
+            <section class="panel overflow-hidden">
+              <div class="toolbar">
+                <div>
+                  <p class="eyebrow">Conversation</p>
+                  <h2>Comments</h2>
+                </div>
+                <span class="stamp">LIVE</span>
+              </div>
+              <div id="commentList" class="stream-list"></div>
+              <form id="commentForm" class="stream-compose stack-form">
+                <textarea id="commentBody" class="field large-field" maxlength="10000" required placeholder="Add an update for the requester or the team"></textarea>
+                <div class="button-row">
+                  <select id="commentVisibility" class="field compact">
+                    <option value="PUBLIC">Public update</option>
+                    <option value="INTERNAL">Internal note</option>
+                  </select>
+                  <button class="button-primary" type="submit">Post comment <span>→</span></button>
+                </div>
+                <p id="commentMessage" class="form-message hidden"></p>
+              </form>
+            </section>
+
+            <section class="panel overflow-hidden">
+              <div class="toolbar">
+                <div>
+                  <p class="eyebrow">Trail</p>
+                  <h2>History &amp; work</h2>
+                </div>
+              </div>
+              <div class="trail-grid">
+                <div>
+                  <p class="form-note trail-label">Status history</p>
+                  <div id="historyList" class="stream-list compact-stream"></div>
+                </div>
+                <div>
+                  <p class="form-note trail-label">Work logs</p>
+                  <div id="worklogList" class="stream-list compact-stream"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="csrf.js"></script>
+    <script src="index-page.js"></script>
+    <script src="ticket-page.js"></script>
+  </body>
+</html>

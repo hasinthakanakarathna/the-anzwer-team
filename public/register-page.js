@@ -74,7 +74,9 @@ document.getElementById('regForm').addEventListener('submit', async (ev) => {
     if (!res.ok) {
       return showMsg(body.error || 'Registration failed');
     }
-    showMsg(accountType === 'EMPLOYEE' ? `Employee identity ${body.employeeId} created. You can now sign in.` : `Customer identity ${body.customerId} created. You can now sign in.`, false);
+    showMsg(accountType === 'EMPLOYEE'
+      ? `Employee identity ${body.employeeId} created and is awaiting admin verification. You cannot sign in until an admin verifies the account.`
+      : `Customer identity ${body.customerId} created. You can now sign in.`, false);
   } catch (e) {
     showMsg('Network error, please try again');
   }
